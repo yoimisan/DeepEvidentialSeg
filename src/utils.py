@@ -196,6 +196,7 @@ def sample_patches(
     """
     从对每个 batch 选取 num_samples 个点，找到对应的 patch，以及对应的 feature，返回 patch 和 feature， stride 表示缩放比例
     NOTE: 这里假定 features 和 images 相同大小
+    TODO: 这里还是用小 feature 来采样，而不是用 interpolated feature 来采样，后续可以改进
     """
     if images.dim() == 3:
         images.unsqueeze_(0)  # Add batch dimension
