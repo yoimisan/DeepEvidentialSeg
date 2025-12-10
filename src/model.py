@@ -1,8 +1,10 @@
+from math import prod
 import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
+from utils import sample_patches
 
 @runtime_checkable
 class BaseConfig(Protocol):
@@ -43,29 +45,36 @@ class FPNFeatureExtractor(smp.FPN):
         # 如果你需要原始尺寸，可能还需要根据 output_stride 进行上采样
         return decoder_output
     
+    def upsample(self, x, size):
+        """
+        上采样到指定大小
+        """
+        return nn.functional.interpolate(
+            x,
+            size=size,
+            mode='bilinear',
+            align_corners=False
+        )
+    
     def get_pixel_wise_features(self, x):
         """
         获取逐像素特征向量
         输入:
             x: [Batch, C, H, W]
         输出:
-            features: [Batch, H, W, decoder_segmentation_channels]
+            features: [Batch, decoder_segmentation_channels, H, W]
         """
         image_size = x.shape[-2:]
         decoder_output = self.forward(x)
         # 调整维度顺序以符合逐像素特征的习惯表示
-        output = nn.functional.interpolate(
-            decoder_output,
-            size=image_size,
-            mode='bilinear',
-            align_corners=False
-        )
-        return output
+        return self.upsample(decoder_output, size=image_size)
+
 
 @dataclass(frozen=True)
 class PatchDecoderConfig(BaseConfig):
     in_channels: int = 128
     patch_size: int = 60
+    num_samples: int = 8
 
     def make_model(self, *, device='cpu') -> 'PatchDecoder':
         model = PatchDecoder(
@@ -113,7 +122,7 @@ class PatchDecoder(nn.Module):
         # x shape: [*, C]
         *bs, _ = x.shape
         x = self.projection(x)
-        x = x.view(sum(bs), self.mid_channels, self.base_size, self.base_size)
+        x = x.view(prod(bs), self.mid_channels, self.base_size, self.base_size)
         output = self.decoder(x)
         return output.view(*bs, 3, self.patch_size, self.patch_size)
 
@@ -124,6 +133,11 @@ class PatchDecoder(nn.Module):
 
 @dataclass(frozen=True)
 class DeepEvidentialSegModelConfig(BaseConfig):
+    # 论文中提到的训练阶段
+    # 0：不训练
+    # 1：训练分类头和 reconstruction
+    # 2：训练分类头和 normalizing flow
+    train_stage: Literal[0, 1, 2] = field(default=1)
     # 特征提取函数的 config
     feature_extractor_config: FPNFeatureExtractorConfig = field(
         default_factory=FPNFeatureExtractorConfig
@@ -132,7 +146,6 @@ class DeepEvidentialSegModelConfig(BaseConfig):
     classification_head_channels: tuple[int, ...] = field(default=(128, 64, 32))
     num_classes: int = 25 # 在 data/RUGD/RUGD_annotations/RUGD_annotation-colormap.txt 中有说明
     # Patch Decoder
-    train: bool = True # 如果是 train 就用，否则就不用
     patch_decoder_config: PatchDecoderConfig = field(
         default_factory=PatchDecoderConfig
     )
@@ -149,7 +162,7 @@ class DeepEvidentialSegModel(nn.Module):
     def __init__(self, config: DeepEvidentialSegModelConfig):
         super().__init__()
         self.config = config
-        self.train_mode = config.train
+        self.train_stage = config.train_stage
         # 特征提取器
         self.feature_extractor = config.feature_extractor_config.make_model()
         # 分类头
@@ -159,10 +172,12 @@ class DeepEvidentialSegModel(nn.Module):
             num_classes=config.num_classes
         )
         # Patch Decoder
-        if self.train_mode:
-            self.path_decoder = config.patch_decoder_config.make_model()
+        if self.train_stage == 1:
+            self.patch_decoder = config.patch_decoder_config.make_model()
+        elif self.train_stage == 2:
+            pass # TODO: 添加 Normalizing Flow 模块
         else:
-            self.path_decoder = None
+            self.patch_decoder = None
         # NOTE: 这里可以添加更多的模块，例如 Normaliz flow, feature reconstruction 等
     
     def _build_classification_head(self, in_channels, hidden_channels, num_classes):
@@ -181,7 +196,7 @@ class DeepEvidentialSegModel(nn.Module):
     def get_current_device(self):
         return next(self.parameters()).device
 
-    def classify(self, images, labels=None):
+    def classify(self, images, labels=None, reconstruction_weight=0.5):
         """ 对输入图像进行分类，同时计算 loss
         """
         device= self.get_current_device()
@@ -190,20 +205,51 @@ class DeepEvidentialSegModel(nn.Module):
             labels = labels.to(device)
 
         loss = None
+        info = {} # 额外信息存储
 
         *_, C, H, W = images.shape
-        features = self.feature_extractor.get_pixel_wise_features(images)
+        latent_features = self.feature_extractor.forward(images)
+        features = self.feature_extractor.upsample(latent_features, size=images.shape[-2:])  # *CHW
         features = features.permute(*range(len(_)), -2, -1, -3) # *CHW -> *HWC
         class_probs = self.classification_head(features)
         logits = torch.log(class_probs + 1e-8)  # 避免 log(0)
 
         if labels is not None:
+            # 训练部分，先计算交叉熵损失，再计算 reconstruction loss
             # 计算交叉熵损失
-            one_hot_labels = nn.functional.one_hot(labels, num_classes=self.config.num_classes)
-            loss = one_hot_labels * logits
-            loss = -loss.sum(dim=-1).mean()  # 平均损失
+            one_hot_labels = nn.functional.one_hot(labels.long(), num_classes=self.config.num_classes)
+            class_loss = one_hot_labels * logits
+            class_loss = -class_loss.sum(dim=-1).mean()  # 平均损失
 
-        return loss, logits
+            info['class_loss'] = class_loss.item()
+            loss = class_loss
+
+            # reconstruction loss
+            if self.train_stage == 1:
+                stride = H // latent_features.shape[-2]  # 根据特征图大小计算步幅 (应该是 4)
+                image_patchs, feature_patchs = sample_patches(
+                    images=images,
+                    features=latent_features,
+                    num_samples=self.config.patch_decoder_config.num_samples,
+                    patch_size=self.config.patch_decoder_config.patch_size,
+                    stride=stride
+                )
+                reconstructed_patches = self.patch_decoder(feature_patchs)  # *3phpw
+                recon_loss = nn.functional.smooth_l1_loss(
+                    reconstructed_patches, 
+                    image_patchs,
+                    reduction='mean', # 对所有像素求平均
+                    beta=1.0, # 使用默认的 beta 值
+                ) # 按照论文中的描述，使用 Smooth L1 Loss
+
+                # 总损失
+                info['recon_loss'] = recon_loss.item()
+                loss += reconstruction_weight * recon_loss
+
+            # 记录信息
+            info['total_loss'] = loss.item()
+
+        return loss, logits, info
 
 if __name__ == "__main__":
     model = FPNFeatureExtractor(

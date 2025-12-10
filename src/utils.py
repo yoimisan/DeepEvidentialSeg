@@ -191,7 +191,7 @@ def sample_patches(
         features: torch.Tensor,
         num_samples: int = 32,
         patch_size: int = 60,
-        stride: int = 1,
+        stride: int = 4,
     ):
     """
     从对每个 batch 选取 num_samples 个点，找到对应的 patch，以及对应的 feature，返回 patch 和 feature， stride 表示缩放比例

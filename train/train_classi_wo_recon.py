@@ -1,3 +1,8 @@
+"""
+Docstring for src.train.train_classi_wo_recon
+
+Training classification only, without reconstruction loss.
+"""
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -15,7 +20,7 @@ lr = 1e-5
 batch_size = 16
 
 # 加载数据集
-dataset = RUGDH5Dataset('./data/rugd.h5')
+dataset = RUGDH5Dataset('./data/rugd_train.h5')
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
 # 模型设置部分
@@ -63,7 +68,7 @@ optim = torch.optim.AdamW(optim_grouped_parameters, weight_decay=1e-2)
 wandb.init(
     project='DeepEvidentialSeg',
     name='classification_only_train',
-    group='classification_only_debug',
+    group='classification_only',
     notes='Training Deep Evidential Segmentation Model - Classification Only',
     tags=['different_lr'],
     config={

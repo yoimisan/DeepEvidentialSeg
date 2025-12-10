@@ -1,6 +1,7 @@
 from torch.utils.data import Dataset
 import h5py
 import cv2
+import torch
 from PIL import Image
 from collections.abc import Sequence
 from typing import Callable
