@@ -134,7 +134,7 @@ def image_reverse_transforms(image: object) -> object:
         mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
         std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
     )
-    image = auto2hwc(image)
+    image = auto2chw(image)
     output = inv_normalize(image)
     output = torch.clamp(output, 0, 1)
     return auto2chw(output)

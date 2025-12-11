@@ -1,3 +1,4 @@
+from enum import Enum
 from math import prod
 import segmentation_models_pytorch as smp
 import torch
@@ -129,7 +130,10 @@ class PatchDecoder(nn.Module):
 
 
 
-
+class TRAIN_STAGE(Enum):
+    NO_TRAIN = 0
+    RECONSTRUCTION = 1
+    NORMALIZING_FLOW = 2
 
 @dataclass(frozen=True)
 class DeepEvidentialSegModelConfig(BaseConfig):
@@ -137,7 +141,7 @@ class DeepEvidentialSegModelConfig(BaseConfig):
     # 0：不训练
     # 1：训练分类头和 reconstruction
     # 2：训练分类头和 normalizing flow
-    train_stage: Literal[0, 1, 2] = field(default=1)
+    train_stage: TRAIN_STAGE = field(default=TRAIN_STAGE.RECONSTRUCTION)
     # 特征提取函数的 config
     feature_extractor_config: FPNFeatureExtractorConfig = field(
         default_factory=FPNFeatureExtractorConfig
@@ -172,9 +176,9 @@ class DeepEvidentialSegModel(nn.Module):
             num_classes=config.num_classes
         )
         # Patch Decoder
-        if self.train_stage == 1:
+        if self.train_stage == TRAIN_STAGE.RECONSTRUCTION:
             self.patch_decoder = config.patch_decoder_config.make_model()
-        elif self.train_stage == 2:
+        elif self.train_stage == TRAIN_STAGE.NORMALIZING_FLOW:
             pass # TODO: 添加 Normalizing Flow 模块
         else:
             self.patch_decoder = None
@@ -225,7 +229,7 @@ class DeepEvidentialSegModel(nn.Module):
             loss = class_loss
 
             # reconstruction loss
-            if self.train_stage == 1:
+            if self.train_stage == TRAIN_STAGE.RECONSTRUCTION:
                 stride = H // latent_features.shape[-2]  # 根据特征图大小计算步幅 (应该是 4)
                 image_patchs, feature_patchs = sample_patches(
                     images=images,

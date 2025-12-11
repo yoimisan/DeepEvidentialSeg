@@ -20,10 +20,15 @@ scaler = torch.amp.GradScaler(device=device)
 epochs = 120 # 过拟合看看最好能到什么程度（实验之后大概 60 epoch 就差不多收敛了）
 lr = 1e-5
 batch_size = 16
+save_interval = 10 # 每多少个 epoch 保存一次模型
+test_interval = 5 # 每多少个 epoch 测试一次模型
 
 # 加载数据集
 dataset = RUGDH5Dataset('./data/rugd_train.h5')
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+val_dataset = RUGDH5Dataset('./data/rugd_val.h5')
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
 # 模型设置部分
 ## 初始化模型
@@ -55,7 +60,7 @@ optim_grouped_parameters = [
         'lr': lr * 10 # 同理
     },
     {
-        'params': model.path_decoder.parameters(),
+        'params': model.patch_decoder.parameters(),
         'lr': lr * 10 # 同理
     }
 ]
@@ -63,16 +68,16 @@ optim = torch.optim.AdamW(optim_grouped_parameters, weight_decay=1e-2)
 
 # 学习率调度器（这里不用了，用了没用）
 scheduler = None
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optim,
-    T_max=epochs,
-    eta_min=1e-7, # 最小学习率
-)
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#     optim,
+#     T_max=epochs,
+#     eta_min=1e-7, # 最小学习率
+# )
 
 # 初始化 WandB
 wandb.init(
     project='DeepEvidentialSeg',
-    name='train_classi_w_recon',
+    name='train_classi_w_recon_ver2',
     group='classification with reconstruction',
     notes='Training classification only, with reconstruction loss. CosineAnnealingLR scheduler.',
     config={
@@ -83,6 +88,7 @@ wandb.init(
 
 # 训练循环
 for epoch in range(epochs):
+    model.train()
     tbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{epochs}', dynamic_ncols=True, leave=False)
     for images, labels in tbar:
         with torch.amp.autocast(device_type=device.type):
@@ -104,9 +110,30 @@ for epoch in range(epochs):
         tbar.set_postfix(
             **{k: f"{v:.2f}" for k, v in info.items()}
         )
+
     if scheduler is not None:
         scheduler.step()
+    if (epoch + 1) % save_interval == 0:
+        torch.save(
+            model.state_dict(),
+            f'./checkpoints/classi_w_recon/deep_evidential_seg_model_epoch{epoch+1}.pth'
+        )
+    if (epoch + 1) % test_interval == 0:
+        model.eval()
+        tbar.set_postfix_str(f'Testing at epoch {epoch+1}...')
+        with torch.no_grad():
+            for images, labels in val_dataloader:
+                with torch.amp.autocast(device_type=device.type):
+                    _, _, info = model.classify(images.to(device), labels.to(device))
+            
+            if wandb.run is not None:
+                wandb.log({
+                    'val_loss': info['total_loss'],
+                    'val_classification_loss': info['class_loss'],
+                    'val_reconstruction_loss': info['recon_loss'],
+                    'val_epoch': epoch,
+                })
     tbar.close()
     
 # 保存模型
-torch.save(model.state_dict(), './checkpoints/classi_w_recon/deep_evidential_seg_model_ver3.pth')
+torch.save(model.state_dict(), './checkpoints/classi_w_recon/deep_evidential_seg_model_final.pth')
