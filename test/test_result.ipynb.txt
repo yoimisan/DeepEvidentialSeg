@@ -1,0 +1,218 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "9bc3991a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import numpy as np\n",
+    "from torch.utils.data import DataLoader\n",
+    "import re\n",
+    "import cv2\n",
+    "\n",
+    "import sys\n",
+    "sys.path.append(\"..\")\n",
+    "sys.path.append(\"../src\")\n",
+    "from src import RUGDH5Dataset, DeepEvidentialSegModelConfig, FPNFeatureExtractorConfig, PatchDecoderConfig\n",
+    "import matplotlib.pyplot as plt\n",
+    "import matplotlib.patches as mpatches\n",
+    "from matplotlib.colors import ListedColormap\n",
+    "from src.utils import image_reverse_transforms, label2name\n",
+    "from src import TRAIN_STAGE"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d2e70841",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# 设置设备和混合精度训练\n",
+    "device = torch.device('cuda:7' if torch.cuda.is_available() else 'cpu')\n",
+    "scaler = torch.amp.GradScaler(device=device)\n",
+    "\n",
+    "# 设置超参数\n",
+    "epochs = 50\n",
+    "lr = 1e-5\n",
+    "batch_size = 16\n",
+    "\n",
+    "# 加载数据集\n",
+    "dataset = RUGDH5Dataset('../data/rugd_train.h5')\n",
+    "dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)\n",
+    "\n",
+    "# 模型设置部分\n",
+    "## 初始化模型\n",
+    "feature_extractor_config = FPNFeatureExtractorConfig()\n",
+    "patch_decoder_config = PatchDecoderConfig(\n",
+    "    num_samples=1024,\n",
+    ")\n",
+    "model_config = DeepEvidentialSegModelConfig(\n",
+    "    feature_extractor_config=feature_extractor_config,\n",
+    "    patch_decoder_config=patch_decoder_config,\n",
+    "    num_classes=20,\n",
+    "    train_stage=TRAIN_STAGE.RECONSTRUCTION,\n",
+    ")\n",
+    "model = model_config.make_model(device=device)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "6c5d773b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ckpt = torch.load(\n",
+    "    '../checkpoints/classi_w_recon/deep_evidential_seg_model_ver3.pth', \n",
+    "    map_location=device\n",
+    ")\n",
+    "\n",
+    "# filter_keys = re.compile(r'path_decoder.*') # path 是写错了，应该是 patch 但是不能改。\n",
+    "# ckpt = {k: v for k, v in ckpt.items() if not filter_keys.match(k)}\n",
+    "\n",
+    "model.load_state_dict(ckpt)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "be90d294",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def visualize_with_legend(ax, mask, title, label2name):\n",
+    "    # 1. Get unique classes present in this specific mask\n",
+    "    unique_labels = np.unique(mask)\n",
+    "    \n",
+    "    # 2. Generate a colormap with enough colors for the max label index (25)\n",
+    "    # using 'tab20' or 'jet' usually provides distinct colors\n",
+    "    base_cmap = plt.get_cmap('tab20b', 25) \n",
+    "    \n",
+    "    # 3. Plot the image\n",
+    "    im = ax.imshow(mask, cmap=base_cmap, vmin=0, vmax=24)\n",
+    "    ax.set_title(title)\n",
+    "    \n",
+    "    # 4. Create the legend handles manually\n",
+    "    legend_patches = []\n",
+    "    for label_idx in unique_labels:\n",
+    "        if label_idx in label2name:\n",
+    "            # Get the color corresponding to this label from the colormap\n",
+    "            color = base_cmap(label_idx / 24.0) \n",
+    "            patch = mpatches.Patch(color=color, label=f\"{label_idx}: {label2name[label_idx]}\")\n",
+    "            legend_patches.append(patch)\n",
+    "    \n",
+    "    # 5. Add legend to the side of the plot\n",
+    "    ax.legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f2a7a751",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "idx = torch.randint(0, len(dataset), (1,)).item()\n",
+    "image, label = dataset[idx]\n",
+    "print(image.shape)\n",
+    "raw_image = image_reverse_transforms(image)\n",
+    "raw_image = raw_image.permute(1, 2, 0).cpu().numpy()\n",
+    "\n",
+    "with torch.no_grad():\n",
+    "    model.eval()\n",
+    "    _, logits, _ = model.classify(image.unsqueeze(0).to(device))\n",
+    "    predicted_label = torch.argmax(logits, dim=-1).cpu().squeeze().numpy()\n",
+    "\n",
+    "print(predicted_label.min(), predicted_label.max())\n",
+    "\n",
+    "fig, ax = plt.subplots(1, 3, figsize=(30, 5)) # Increased width slightly for legends\n",
+    "\n",
+    "# Plot 1: Input Image\n",
+    "ax[0].set_title('Input Image')\n",
+    "ax[0].imshow(raw_image)\n",
+    "ax[0].axis('off')\n",
+    "\n",
+    "# Plot 2: Ground Truth with Legend\n",
+    "visualize_with_legend(ax[1], label, 'Ground Truth', label2name)\n",
+    "ax[1].axis('off')\n",
+    "\n",
+    "# Plot 3: Predicted Label with Legend\n",
+    "visualize_with_legend(ax[2], predicted_label, 'Predicted Label', label2name)\n",
+    "ax[2].axis('off')\n",
+    "\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "8e43569a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "features = model.feature_extractor.forward(image.unsqueeze(0).to(device))\n",
+    "print(features.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "b10a701d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "feature_x, feature_y = 120, 140\n",
+    "mid = features[..., feature_x, feature_y]\n",
+    "image_x, image_y = feature_x * 4, feature_y * 4\n",
+    "\n",
+    "x1, y1 = image_x - 30, image_y - 30\n",
+    "x2, y2 = image_x + 30, image_y + 30\n",
+    "\n",
+    "raw_image_region = (raw_image * 255).astype(np.uint8).transpose(2, 0, 1)\n",
+    "plt.imshow(raw_image_region.transpose(1, 2, 0))\n",
+    "plt.gca().add_patch(mpatches.Rectangle((y1, x1), y2 - y1, x2 - x1, linewidth=2, edgecolor='r', facecolor='None'))\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "6229e2ef",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "patch = model.patch_decoder.forward(mid)\n",
+    "patch.shape\n",
+    "\n",
+    "raw_patch = image_reverse_transforms(patch.squeeze().cpu().detach())\n",
+    "plt.imshow(raw_patch.permute(1, 2, 0))"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "DeepEvidentialSeg",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.14"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

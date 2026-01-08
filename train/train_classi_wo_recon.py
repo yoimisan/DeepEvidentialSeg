@@ -3,6 +3,18 @@ Docstring for src.train.train_classi_wo_recon
 
 Training classification only, without reconstruction loss.
 """
+import sys
+import os
+
+# 获取当前脚本的绝对路径 (DEEPEVIDENTIALSEG/train/train_classi_w_recon.py)
+current_file_path = os.path.abspath(__file__)
+# 获取当前脚本所在目录 (DEEPEVIDENTIALSEG/train)
+current_dir = os.path.dirname(current_file_path)
+# 获取项目根目录 (DEEPEVIDENTIALSEG)
+project_root = os.path.dirname(current_dir)
+
+# 将项目根目录添加到系统路径中
+sys.path.append(project_root)
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader

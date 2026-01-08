@@ -100,7 +100,7 @@ def _split_dataset(rugd_files_path, unseen_labels: set[int]):
     return train_files_path, val_files_path, test_files_path
 
 
-def create_rugd_h5(root_dir: str, save_path: str, split: bool = False):
+def create_rugd_h5(root_dir: str, save_path: str, split: bool = True):
     """
     Create an HDF5 file containing the paths to all RUGD images in the specified directory.
 

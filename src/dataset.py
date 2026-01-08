@@ -6,7 +6,7 @@ from PIL import Image
 from collections.abc import Sequence
 from typing import Callable
 from torchvision import transforms as T
-from utils import _random_crop, image_transforms, label_transforms
+from .utils import _random_crop, image_transforms, label_transforms
 
 
 class RUGDH5Dataset(Dataset):
