@@ -33,6 +33,9 @@ class AffineCouplingLayer(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, self.split_len2 * 2) # 输出 s 和 t
         )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
 
     def forward(self, x, reverse=False):
         x1, x2 = x[:, :self.split_len1], x[:, self.split_len1:]
@@ -120,18 +123,16 @@ class DifferentiableGMM(nn.Module):
             covs = torch.from_numpy(covariances).float()
             self.register_buffer('precs', 1.0 / (covs + 1e-6))
             self.cov_type = 'diag'
+            ldc = torch.sum(torch.log(covs), dim=1) 
         else: # full
             covs = torch.from_numpy(covariances).float()
             self.register_buffer('precs', torch.inverse(covs + 1e-6 * torch.eye(self.n_features)))
             self.cov_type = 'full'
+            ldc = torch.logdet(covs)
 
         self.register_buffer('weights', torch.from_numpy(weights).float())
+        self.register_buffer('log_det_covs', ldc)
         
-        # 计算 log det (常量)
-        if self.cov_type == 'diag':
-            self.log_det_covs = torch.sum(torch.log(covs), dim=1) 
-        else:
-            self.log_det_covs = torch.logdet(covs)
 
     def log_prob(self, z):
         # z: [Batch, D]
@@ -154,7 +155,8 @@ class DifferentiableGMM(nn.Module):
             mahalanobis = torch.matmul(torch.matmul(diff.unsqueeze(2), precs_expanded), diff_expanded).squeeze()
             
         # Log Gaussian constant: -0.5 * (D * log(2pi) + log|Sigma| + Mahalanobis)
-        log_2pi = D * np.log(2 * np.pi)
+        # log_2pi = D * np.log(2 * np.pi)
+        log_2pi = torch.tensor(D * np.log(2 * np.pi), device=z.device)
         log_probs_k = -0.5 * (log_2pi + self.log_det_covs.unsqueeze(0) + mahalanobis)
         
         # Add weights: log(w_k * N(...)) = log(w_k) + log(N(...))
@@ -246,10 +248,12 @@ class FPNFeatureExtractor(smp.FPN):
         输出:
             features: [Batch, decoder_segmentation_channels, H, W]
         """
-        image_size = x.shape[-2:]
+        # image_size = x.shape[-2:]
+        # decoder_output = self.forward(x)
+        # # 调整维度顺序以符合逐像素特征的习惯表示
+        # return self.upsample(decoder_output, size=image_size)
         decoder_output = self.forward(x)
-        # 调整维度顺序以符合逐像素特征的习惯表示
-        return self.upsample(decoder_output, size=image_size)
+        return decoder_output
 
 
 @dataclass(frozen=True)
@@ -373,43 +377,134 @@ class DeepEvidentialSegModel(nn.Module):
             self.density_estimator = DensityEstimator(in_channels=feat_dim, gmm_model=None)
         else:
             self.density_estimator = None
+        self.feature_norm = nn.BatchNorm2d(feat_dim)
+        self.register_buffer('log_density_scale', torch.tensor(0.0))
+
+
     def fit_gmm(self, dataloader):
         """
         在 Stage 2 开始前运行。提取所有训练数据的特征，拟合 GMM，然后初始化 Base Dist。
         """
         print("Extracting features for GMM fitting...")
         self.eval()
+        self.density_estimator.eval() 
         all_features = []
         device = self.get_current_device()
         
-        # 随机采样一部分像素以节省内存 (例如取 1%)
+        # 设定最大样本数，防止 sklearn 卡死
+        # 50,000 个样本对于估计分布已经足够了
+        MAX_SAMPLES = 50000 
+        total_samples = 0
+        
         with torch.no_grad():
             for images, _ in tqdm(dataloader):
                 images = images.to(device)
                 features = self.feature_extractor.get_pixel_wise_features(images) # [B, C, H, W]
-                # 展平并采样
+                features = self.feature_norm(features)
+                
+                # 展平
                 features = features.permute(0, 2, 3, 1).reshape(-1, features.shape[1])
-                indices = torch.randperm(features.shape[0])[:1000] # 每张图采样 1000 个点
-                all_features.append(features[indices].cpu().numpy())
-        
+                
+                # 每张图采样 1000 个点
+                num_to_sample = 1000
+                if features.shape[0] < num_to_sample:
+                    num_to_sample = features.shape[0]
+                    
+                indices = torch.randperm(features.shape[0])[:num_to_sample]
+                sampled_feats = features[indices]
+                
+                # 通过 Flow 变换得到 z
+                z, _ = self.density_estimator.flow(sampled_feats)
+                
+                z_numpy = z.cpu().numpy()
+                all_features.append(z_numpy)
+                
+                total_samples += z_numpy.shape[0]
+                
+                # 如果收集够了，提前退出
+                if total_samples >= MAX_SAMPLES:
+                    print(f"Collected enough samples ({total_samples}), stopping extraction.")
+                    break
+
         all_features = np.concatenate(all_features, axis=0)
-        print(f"Fitting GMM with {self.config.gmm_components} components on {all_features.shape[0]} samples...")
         
-        gmm = GaussianMixture(n_components=self.config.gmm_components, covariance_type='full', verbose=1)
+        #再一次检查是否有 NaN
+        if np.isnan(all_features).any():
+            print("Warning: NaNs detected in extracted features! Replacing with 0.")
+            all_features = np.nan_to_num(all_features)
+            
+        print(f"Fitting GMM with {self.config.gmm_components} components on {all_features.shape[0]} samples (Dimension: {all_features.shape[1]})...")
+        
+        # 初始化 GMM
+        gmm = GaussianMixture(n_components=self.config.gmm_components, covariance_type='diag', verbose=2)
         gmm.fit(all_features)
         
         # 初始化 DifferentiableGMM 并赋值给 DensityEstimator
         diff_gmm = DifferentiableGMM(gmm.means_, gmm.covariances_, gmm.weights_)
         self.density_estimator.base_dist = diff_gmm.to(device)
         print("GMM fitted and loaded.")
+        
+        # ================= [计算 Scale 部分] =================
+        print("Calculating log-density normalization factor...")
+        
+        # 我们可以直接重用刚才收集的 all_features 对应的原始特征
+        # 但为了代码简单，我们重新取一小批数据来算 Scale，确保逻辑清晰
+        # 只需要几千个点就算得准了
+        
+        temp_features_list = []
+        samples_count = 0
+        
+        with torch.no_grad():
+            for images, _ in dataloader:
+                images = images.to(device)
+                f = self.feature_extractor.get_pixel_wise_features(images)
+                f = self.feature_norm(f)
+                f = f.permute(0, 2, 3, 1).reshape(-1, f.shape[1])
+                
+                # 随机采一点
+                indices = torch.randperm(f.shape[0])[:1000]
+                f_subset = f[indices]
+                
+                temp_features_list.append(f_subset)
+                samples_count += f_subset.shape[0]
+                if samples_count > 5000: 
+                    break 
+        
+        features_subset = torch.cat(temp_features_list, dim=0)
+        
+        # 计算这些原始 x 经过 Flow + GMM 后的 log_prob
+        # [注意] 这里要分批计算防止 OOM，虽然 5000 个点一般没事，但为了稳妥
+        batch_size = 1024
+        total_log_prob = 0.0
+        count = 0
+        
+        self.density_estimator.eval()
+        
+        for i in range(0, features_subset.size(0), batch_size):
+            batch = features_subset[i : i + batch_size]
+            batch_log_prob = self.density_estimator(batch)
+            total_log_prob += batch_log_prob.sum().item()
+            count += batch.size(0)
+            
+        mean_log_prob = total_log_prob / count
+        
+        self.log_density_scale.fill_(mean_log_prob)
+        print(f"Log density scale set to: {mean_log_prob:.4f}")
+        
+        # 恢复训练模式
+        self.train()
+        
 
     def evidential_loss(self, logits, labels, log_prob_x):
         """
         实现论文公式 (7): Bayesian Loss
         Dir(p | alpha) where alpha = 1 + N * p(x) * softmax(logits)
         """
+        # log_prob_x = torch.clamp(log_prob_x, min=-20.0, max=20.0)
+        shifted_log_prob = log_prob_x - self.log_density_scale
+        shifted_log_prob = torch.clamp(shifted_log_prob, min=-10.0, max=10.0)
         probs = torch.softmax(logits, dim=-1) # beta_phi(x)
-        density = torch.exp(log_prob_x).unsqueeze(1) # p_theta(x)
+        density = torch.exp(shifted_log_prob).unsqueeze(1) # p_theta(x)
         
         # 证据 N (scale factor)，论文没给具体数值，通常需要调节或者设为 dataset size 的 scaling
         N = 10.0 
@@ -430,6 +525,7 @@ class DeepEvidentialSegModel(nn.Module):
         # 2. Regularization term (Entropy / KL)
         # 论文提出 lambda = 1 / (N * p(x))
         lam = 1.0 / (N * density.squeeze(1) + 1e-6)
+        lam = torch.clamp(lam, max=1.0) # 关键：限制正则项的强度
         
         # KL Divergence between Dir(alpha) and Dir(1,1,...1)
         # 这是一个简化的 KL，用于惩罚证据过高（Confidence Penalty）
@@ -484,12 +580,16 @@ class DeepEvidentialSegModel(nn.Module):
         # 在 Stage 2，为了稳定密度估计，通常冻结 encoder 或将其 detach
         if self.train_stage == TRAIN_STAGE.NORMALIZING_FLOW:
             with torch.no_grad():
-                latent_features = self.feature_extractor.forward(images)
-                features_upsampled = self.feature_extractor.upsample(latent_features, size=images.shape[-2:])
+                raw_features = self.feature_extractor.forward(images)
+            latent_features = self.feature_norm(raw_features)
+            features_upsampled = self.feature_extractor.upsample(latent_features, size=images.shape[-2:])
         else:
             latent_features = self.feature_extractor.forward(images)
+            latent_features = self.feature_norm(latent_features)
             features_upsampled = self.feature_extractor.upsample(latent_features, size=images.shape[-2:])
         
+        
+
         # =================================================
         # 2. 准备数据形状 [B, C, H, W] -> [N, C]
         # =================================================
@@ -565,14 +665,16 @@ class DeepEvidentialSegModel(nn.Module):
                 
                 # 随机采样 1024 个点
                 indices = torch.randperm(feat_flat.size(0))[:num_samples]
-                sampled_features = feat_flat[indices].detach()
+                # sampled_features = feat_flat[indices].detach()
+                sampled_features = feat_flat[indices]
                 
                 # 只对这 1024 个点跑密度估计
                 log_prob_x = self.density_estimator(sampled_features) 
                 
                 # 对应的 logits 也采样
                 sampled_logits = logits_flat[indices]
-                sampled_labels = labels_flat[indices] # 如果有 labels 的话
+                # sampled_labels = labels_flat[indices] # 如果有 labels 的话
+                sampled_labels = labels.flatten().long()[indices]
                 
                 # B. Evidential Loss
                 # 联合优化 Flow 和 Classifier (Fine-tune)
